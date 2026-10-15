@@ -36,17 +36,16 @@ namespace detail
     {
 
 //! Number of free bonds of a particle that is not local to the rank finding a candidate
-const unsigned int UNKNOWN_FREE_BONDS = 0xffffffff;
+const unsigned int UNKNOWN_FREE_BONDS = 0;
 
 //! Pair of particles that may be bonded
 /*!
  * The particle from the first group is stored first. When the two groups are the same, the
  * particle with the smaller tag is stored first instead.
  *
- * The number of free bonds is the number of additional bonds a particle can form. It is only
- * known for particles that are local to the rank that found the candidate. Otherwise, it is
- * UNKNOWN_FREE_BONDS and must be filled in from the candidate found by the rank that owns the
- * particle.
+ * The number of free bonds is positive for local particles: particles with no free bonds do not
+ * produce candidates. For remote particles, UNKNOWN_FREE_BONDS marks the capacity that must be
+ * filled in from the candidate found by the rank that owns the particle.
  */
 struct BondCandidate
     {
@@ -119,9 +118,13 @@ HOSTDEVICE inline unsigned int countFreeBonds(unsigned int idx,
         if (bond_table[bond_table_indexer(idx, bond)].idx[1] == bond_type)
             {
             ++num_bonds;
+            if (num_bonds == max_bonds)
+                {
+                return 0;
+                }
             }
         }
-    return (num_bonds < max_bonds) ? max_bonds - num_bonds : 0;
+    return max_bonds - num_bonds;
     }
 
 //! Test if particles in a neighbor list can be bonded
@@ -196,7 +199,7 @@ class BondCandidateFinder
         // particles, so only test the pair from the particle with the smaller index.
         const bool j_is_local = (j < m_N);
         if (j_is_local
-            && (j < i || m_free_bonds[j] == 0
+            && (j <= i || m_free_bonds[j] == 0
                 || (!m_groups_identical && m_group_ids[i] == m_group_ids[j])))
             {
             return false;
@@ -210,7 +213,7 @@ class BondCandidateFinder
                                   postype_j.z - postype_i.z);
         dr = m_box.minImage(dr);
         const Scalar r_sq = dot(dr, dr);
-        if (r_sq >= m_r_cut_sq)
+        if (!(r_sq < m_r_cut_sq))
             {
             return false;
             }

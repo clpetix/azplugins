@@ -11,7 +11,6 @@
 
 #include <thrust/device_ptr.h>
 #include <thrust/execution_policy.h>
-#include <thrust/reduce.h>
 #include <thrust/scan.h>
 #include <thrust/sort.h>
 
@@ -63,7 +62,7 @@ __global__ void set_bonding_state(unsigned int* d_group_ids,
     }
 
 /*!
- * \param d_n_candidates Number of candidates of each particle (output, or nullptr)
+ * \param d_counts Counts in entries 1 through N, with entry 0 set to zero (output, or nullptr)
  * \param d_candidates Compact array of candidates (output, or nullptr)
  * \param d_offsets First index of each particle's candidates in \a d_candidates
  * \param find_candidate Finder for candidate bonds
@@ -72,13 +71,13 @@ __global__ void set_bonding_state(unsigned int* d_group_ids,
  * \param d_head_list Start of each particle's neighbors in \a d_nlist
  * \param N Number of local particles
  *
- * One thread is used per local particle. The candidates are counted if \a d_n_candidates is not
+ * One thread is used per local particle. The candidates are counted if \a d_counts is not
  * null, and they are written if \a d_candidates is not null. The finder is deterministic, so the
  * same candidates are found when they are counted and when they are written.
  */
-__global__ void find_bond_candidates(unsigned int* d_n_candidates,
+__global__ void find_bond_candidates(size_t* d_counts,
                                      detail::BondCandidate* d_candidates,
-                                     const unsigned int* d_offsets,
+                                     const size_t* d_offsets,
                                      const detail::BondCandidateFinder find_candidate,
                                      const unsigned int* d_n_neigh,
                                      const unsigned int* d_nlist,
@@ -108,9 +107,13 @@ __global__ void find_bond_candidates(unsigned int* d_n_candidates,
             }
         }
 
-    if (d_n_candidates)
+    if (d_counts)
         {
-        d_n_candidates[i] = n_candidates;
+        d_counts[static_cast<size_t>(i) + 1] = n_candidates;
+        if (i == 0)
+            {
+            d_counts[0] = 0;
+            }
         }
     }
     } // end namespace kernel
@@ -162,7 +165,7 @@ cudaError_t set_bonding_state(unsigned int* d_group_ids,
     }
 
 /*!
- * \param d_n_candidates Number of candidates of each particle
+ * \param d_offsets Array of N+1 entries to fill with a zero followed by the candidate counts
  * \param find_candidate Finder for candidate bonds
  * \param d_n_neigh Number of neighbors of each particle
  * \param d_nlist Neighbor list
@@ -170,7 +173,7 @@ cudaError_t set_bonding_state(unsigned int* d_group_ids,
  * \param N Number of local particles
  * \param block_size Number of threads per block
  */
-cudaError_t count_bond_candidates(unsigned int* d_n_candidates,
+cudaError_t count_bond_candidates(size_t* d_offsets,
                                   const detail::BondCandidateFinder& find_candidate,
                                   const unsigned int* d_n_neigh,
                                   const unsigned int* d_nlist,
@@ -184,7 +187,7 @@ cudaError_t count_bond_candidates(unsigned int* d_n_candidates,
     max_block_size = attr.maxThreadsPerBlock;
 
     const unsigned int run_block_size = min(block_size, max_block_size);
-    kernel::find_bond_candidates<<<N / run_block_size + 1, run_block_size>>>(d_n_candidates,
+    kernel::find_bond_candidates<<<N / run_block_size + 1, run_block_size>>>(d_offsets,
                                                                              nullptr,
                                                                              nullptr,
                                                                              find_candidate,
@@ -197,26 +200,21 @@ cudaError_t count_bond_candidates(unsigned int* d_n_candidates,
     }
 
 /*!
- * \param d_offsets First index of each particle's candidates in a compact array
- * \param d_n_candidates Number of candidates of each particle
+ * \param d_offsets Array of N+1 counts, overwritten with offsets and the total in entry N
  * \param N Number of local particles
  * \param alloc Allocator for temporary memory
  * \returns Total number of candidates
  */
-unsigned int scan_bond_candidates(unsigned int* d_offsets,
-                                  const unsigned int* d_n_candidates,
-                                  const unsigned int N,
-                                  CachedAllocator& alloc)
+size_t scan_bond_candidates(size_t* d_offsets, const unsigned int N, CachedAllocator& alloc)
     {
     if (N == 0)
         {
         return 0;
         }
 
-    thrust::device_ptr<const unsigned int> n_candidates(d_n_candidates);
-    thrust::device_ptr<unsigned int> offsets(d_offsets);
-    thrust::exclusive_scan(thrust::cuda::par(alloc), n_candidates, n_candidates + N, offsets);
-    return thrust::reduce(thrust::cuda::par(alloc), n_candidates, n_candidates + N);
+    thrust::device_ptr<size_t> offsets(d_offsets);
+    thrust::inclusive_scan(thrust::cuda::par(alloc), offsets + 1, offsets + N + 1, offsets + 1);
+    return offsets[N];
     }
 
 /*!
@@ -230,7 +228,7 @@ unsigned int scan_bond_candidates(unsigned int* d_offsets,
  * \param block_size Number of threads per block
  */
 cudaError_t write_bond_candidates(detail::BondCandidate* d_candidates,
-                                  const unsigned int* d_offsets,
+                                  const size_t* d_offsets,
                                   const detail::BondCandidateFinder& find_candidate,
                                   const unsigned int* d_n_neigh,
                                   const unsigned int* d_nlist,
@@ -262,7 +260,7 @@ cudaError_t write_bond_candidates(detail::BondCandidate* d_candidates,
  * \param alloc Allocator for temporary memory
  */
 cudaError_t sort_bond_candidates(detail::BondCandidate* d_candidates,
-                                 const unsigned int num_candidates,
+                                 const size_t num_candidates,
                                  CachedAllocator& alloc)
     {
     thrust::device_ptr<detail::BondCandidate> candidates(d_candidates);

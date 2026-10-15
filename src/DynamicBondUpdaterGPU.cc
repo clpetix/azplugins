@@ -46,7 +46,7 @@ DynamicBondUpdaterGPU::DynamicBondUpdaterGPU(std::shared_ptr<SystemDefinition> s
                          max_bonds_1,
                          max_bonds_2,
                          probability),
-      m_n_candidates(m_exec_conf), m_candidate_offsets(m_exec_conf), m_gpu_candidates(m_exec_conf)
+      m_candidate_offsets(m_exec_conf), m_gpu_candidates(m_exec_conf)
     {
     m_tuner_state.reset(new Autotuner<1>({AutotunerBase::makeBlockSizeRange(m_exec_conf)},
                                          m_exec_conf,
@@ -89,6 +89,12 @@ void DynamicBondUpdaterGPU::computeBondingState()
 
     auto set_group = [&](ParticleGroup& group, unsigned int group_id, unsigned int max_bonds)
     {
+        const unsigned int num_members = group.getNumMembers();
+        if (num_members == 0)
+            {
+            return;
+            }
+
         ArrayHandle<unsigned int> d_members(group.getIndexArray(),
                                             access_location::device,
                                             access_mode::read);
@@ -96,7 +102,7 @@ void DynamicBondUpdaterGPU::computeBondingState()
         gpu::set_bonding_state(d_group_ids.data,
                                d_free_bonds.data,
                                d_members.data,
-                               group.getNumMembers(),
+                               num_members,
                                group_id,
                                max_bonds,
                                m_bond_type,
@@ -121,6 +127,13 @@ void DynamicBondUpdaterGPU::computeBondingState()
  */
 void DynamicBondUpdaterGPU::findBondCandidates(uint64_t timestep)
     {
+    m_candidates.clear();
+    const unsigned int N = m_pdata->getN();
+    if (N == 0)
+        {
+        return;
+        }
+
     ArrayHandle<unsigned int> d_n_neigh(m_nlist->getNNeighArray(),
                                         access_location::device,
                                         access_mode::read);
@@ -145,7 +158,6 @@ void DynamicBondUpdaterGPU::findBondCandidates(uint64_t timestep)
                                         access_location::device,
                                         access_mode::read);
 
-    const unsigned int N = m_pdata->getN();
     const detail::BondCandidateFinder find_candidate(d_pos.data,
                                                      d_tag.data,
                                                      d_group_ids.data,
@@ -162,15 +174,14 @@ void DynamicBondUpdaterGPU::findBondCandidates(uint64_t timestep)
                                                      m_sysdef->getSeed());
 
     // count the candidates of each particle to find where to write them
-    m_n_candidates.resize(N);
-    m_candidate_offsets.resize(N);
-    unsigned int num_candidates = 0;
+    m_candidate_offsets.resize(static_cast<size_t>(N) + 1);
+    size_t num_candidates = 0;
         {
-        ArrayHandle<unsigned int> d_n_candidates(m_n_candidates,
-                                                 access_location::device,
-                                                 access_mode::overwrite);
+        ArrayHandle<size_t> d_offsets(m_candidate_offsets,
+                                      access_location::device,
+                                      access_mode::overwrite);
         m_tuner_count->begin();
-        gpu::count_bond_candidates(d_n_candidates.data,
+        gpu::count_bond_candidates(d_offsets.data,
                                    find_candidate,
                                    d_n_neigh.data,
                                    d_nlist.data,
@@ -181,32 +192,26 @@ void DynamicBondUpdaterGPU::findBondCandidates(uint64_t timestep)
             CHECK_CUDA_ERROR();
         m_tuner_count->end();
 
-        ArrayHandle<unsigned int> d_offsets(m_candidate_offsets,
-                                            access_location::device,
-                                            access_mode::overwrite);
-        num_candidates = gpu::scan_bond_candidates(d_offsets.data,
-                                                   d_n_candidates.data,
-                                                   N,
-                                                   m_exec_conf->getCachedAllocator());
+        num_candidates
+            = gpu::scan_bond_candidates(d_offsets.data, N, m_exec_conf->getCachedAllocator());
         if (m_exec_conf->isCUDAErrorCheckingEnabled())
             CHECK_CUDA_ERROR();
         }
 
-    m_candidates.clear();
     if (num_candidates == 0)
         {
         return;
         }
 
-    // write the candidates to a compact array and sort them
+    // write the candidates to a compact array
     m_gpu_candidates.resize(num_candidates);
         {
         ArrayHandle<detail::BondCandidate> d_candidates(m_gpu_candidates,
                                                         access_location::device,
                                                         access_mode::overwrite);
-        ArrayHandle<unsigned int> d_offsets(m_candidate_offsets,
-                                            access_location::device,
-                                            access_mode::read);
+        ArrayHandle<size_t> d_offsets(m_candidate_offsets,
+                                      access_location::device,
+                                      access_mode::read);
         m_tuner_write->begin();
         gpu::write_bond_candidates(d_candidates.data,
                                    d_offsets.data,
@@ -220,11 +225,15 @@ void DynamicBondUpdaterGPU::findBondCandidates(uint64_t timestep)
             CHECK_CUDA_ERROR();
         m_tuner_write->end();
 
-        gpu::sort_bond_candidates(d_candidates.data,
-                                  num_candidates,
-                                  m_exec_conf->getCachedAllocator());
-        if (m_exec_conf->isCUDAErrorCheckingEnabled())
-            CHECK_CUDA_ERROR();
+        // MPI needs to merge partial candidates before sorting by priority.
+        if (!m_sysdef->isDomainDecomposed())
+            {
+            gpu::sort_bond_candidates(d_candidates.data,
+                                      num_candidates,
+                                      m_exec_conf->getCachedAllocator());
+            if (m_exec_conf->isCUDAErrorCheckingEnabled())
+                CHECK_CUDA_ERROR();
+            }
         }
 
     // the bonds are selected on the CPU

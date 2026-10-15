@@ -10,6 +10,8 @@
 #include "DynamicBondUpdater.h"
 
 #include <algorithm>
+#include <cmath>
+#include <limits>
 #include <stdexcept>
 
 namespace hoomd
@@ -76,10 +78,7 @@ DynamicBondUpdater::~DynamicBondUpdater()
     {
     m_exec_conf->msg->notice(5) << "Destroying DynamicBondUpdater" << std::endl;
 
-    if (m_attached)
-        {
-        m_nlist->removeRCutMatrix(m_r_cut_nlist);
-        }
+    notifyDetach();
 
     m_pdata->getGlobalParticleNumberChangeSignal()
         .disconnect<DynamicBondUpdater, &DynamicBondUpdater::slotGlobalParticleNumberChange>(this);
@@ -90,18 +89,25 @@ DynamicBondUpdater::~DynamicBondUpdater()
  */
 void DynamicBondUpdater::update(uint64_t timestep)
     {
-    if (m_groups_identical && m_max_bonds_1 != m_max_bonds_2)
-        {
-        throw std::invalid_argument("DynamicBondUpdater: max_bonds_1 and max_bonds_2 must be "
-                                    "equal when the groups contain the same particles.");
-        }
-
     // groups and the particle types in them can change with the number of particles
     if (m_particles_changed)
         {
         checkGroups();
         updateRCutMatrix();
         m_particles_changed = false;
+        }
+
+    if (m_groups_identical && m_max_bonds_1 != m_max_bonds_2)
+        {
+        throw std::invalid_argument("DynamicBondUpdater: max_bonds_1 and max_bonds_2 must be "
+                                    "equal when the groups contain the same particles.");
+        }
+
+    // These conditions are global, so all ranks skip the update together.
+    if (m_probability == Scalar(0.0) || m_group_1->getNumMembersGlobal() == 0
+        || m_group_2->getNumMembersGlobal() == 0)
+        {
+        return;
         }
 
     m_nlist->compute(timestep);
@@ -137,6 +143,7 @@ void DynamicBondUpdater::notifyDetach()
     if (m_attached)
         {
         m_nlist->removeRCutMatrix(m_r_cut_nlist);
+        m_nlist->notifyRCutMatrixChange();
         }
     m_attached = false;
     }
@@ -146,9 +153,9 @@ void DynamicBondUpdater::notifyDetach()
  */
 void DynamicBondUpdater::setRCut(Scalar r_cut)
     {
-    if (r_cut <= Scalar(0.0))
+    if (!std::isfinite(r_cut) || r_cut <= Scalar(0.0))
         {
-        throw std::invalid_argument("DynamicBondUpdater: r_cut must be positive.");
+        throw std::invalid_argument("DynamicBondUpdater: r_cut must be finite and positive.");
         }
     m_r_cut = r_cut;
     updateRCutMatrix();
@@ -159,7 +166,7 @@ void DynamicBondUpdater::setRCut(Scalar r_cut)
  */
 void DynamicBondUpdater::setProbability(Scalar probability)
     {
-    if (probability < Scalar(0.0) || probability > Scalar(1.0))
+    if (!(probability >= Scalar(0.0) && probability <= Scalar(1.0)))
         {
         throw std::invalid_argument("DynamicBondUpdater: probability must be between 0 and 1.");
         }
@@ -177,6 +184,10 @@ void DynamicBondUpdater::computeBondingState()
     const unsigned int N = m_pdata->getN();
     m_group_ids.resize(N);
     m_free_bonds.resize(N);
+    if (N == 0)
+        {
+        return;
+        }
 
     ArrayHandle<unsigned int> h_group_ids(m_group_ids,
                                           access_location::host,
@@ -197,10 +208,11 @@ void DynamicBondUpdater::computeBondingState()
 
     auto set_group = [&](ParticleGroup& group, unsigned int group_id, unsigned int max_bonds)
     {
+        const unsigned int num_members = group.getNumMembers();
         ArrayHandle<unsigned int> h_members(group.getIndexArray(),
                                             access_location::host,
                                             access_mode::read);
-        for (unsigned int member = 0; member < group.getNumMembers(); ++member)
+        for (unsigned int member = 0; member < num_members; ++member)
             {
             const unsigned int idx = h_members.data[member];
             h_group_ids.data[idx] = group_id;
@@ -224,10 +236,18 @@ void DynamicBondUpdater::computeBondingState()
  * \param timestep Current timestep
  *
  * Each local particle that can form bonds is tested against its neighbors. The candidates are
- * sorted by priority.
+ * sorted by priority on one rank. With domain decomposition, sorting is deferred until the
+ * candidates have been gathered and merged.
  */
 void DynamicBondUpdater::findBondCandidates(uint64_t timestep)
     {
+    m_candidates.clear();
+    const unsigned int N = m_pdata->getN();
+    if (N == 0)
+        {
+        return;
+        }
+
     ArrayHandle<unsigned int> h_n_neigh(m_nlist->getNNeighArray(),
                                         access_location::host,
                                         access_mode::read);
@@ -250,7 +270,6 @@ void DynamicBondUpdater::findBondCandidates(uint64_t timestep)
                                         access_location::host,
                                         access_mode::read);
 
-    const unsigned int N = m_pdata->getN();
     const detail::BondCandidateFinder find_candidate(h_pos.data,
                                                      h_tag.data,
                                                      h_group_ids.data,
@@ -266,7 +285,6 @@ void DynamicBondUpdater::findBondCandidates(uint64_t timestep)
                                                      timestep,
                                                      m_sysdef->getSeed());
 
-    m_candidates.clear();
     for (unsigned int i = 0; i < N; ++i)
         {
         if (!find_candidate.canBond(i))
@@ -286,7 +304,12 @@ void DynamicBondUpdater::findBondCandidates(uint64_t timestep)
             }
         }
 
-    std::sort(m_candidates.begin(), m_candidates.end(), detail::CompareBondCandidatesByDistance());
+    if (!m_sysdef->isDomainDecomposed())
+        {
+        std::sort(m_candidates.begin(),
+                  m_candidates.end(),
+                  detail::CompareBondCandidatesByDistance());
+        }
     }
 
 #ifdef ENABLE_MPI
@@ -302,30 +325,47 @@ void DynamicBondUpdater::gatherBondCandidates()
     const unsigned int n_ranks = m_exec_conf->getNRanks();
     const bool is_root = (m_exec_conf->getRank() == 0);
 
-    // candidates are plain data, so they can be sent as bytes
+    // Check counts on every rank before narrowing to the int counts used by MPI_Gatherv.
+    // All ranks must fail together if the gathered array is too large.
+    const uint64_t n_candidates = m_candidates.size();
+    std::vector<uint64_t> counts(n_ranks);
+    MPI_Allgather(&n_candidates, 1, MPI_UINT64_T, counts.data(), 1, MPI_UINT64_T, mpi_comm);
+
+    std::vector<int> n_candidates_per_rank(n_ranks);
+    std::vector<int> offsets(n_ranks);
+    uint64_t total = 0;
+    for (unsigned int rank = 0; rank < n_ranks; ++rank)
+        {
+        if (counts[rank] > std::numeric_limits<int>::max() - total)
+            {
+            throw std::overflow_error("DynamicBondUpdater: too many candidates for MPI_Gatherv.");
+            }
+        offsets[rank] = static_cast<int>(total);
+        n_candidates_per_rank[rank] = static_cast<int>(counts[rank]);
+        total += counts[rank];
+        }
+
+    if (total == 0)
+        {
+        return;
+        }
+    if (is_root)
+        {
+        // Rank 0's candidates already occupy the first receive segment. Gather in place to
+        // keep a single candidate buffer on root and reuse its capacity on the next update.
+        m_candidates.resize(total);
+        }
+
+    // Candidates are plain data, so they can be sent as bytes. The datatype keeps MPI counts
+    // in units of candidates instead of bytes.
     MPI_Datatype mpi_candidate;
     MPI_Type_contiguous(sizeof(detail::BondCandidate), MPI_BYTE, &mpi_candidate);
     MPI_Type_commit(&mpi_candidate);
 
-    int n_candidates = static_cast<int>(m_candidates.size());
-    std::vector<int> n_candidates_per_rank(n_ranks);
-    MPI_Gather(&n_candidates, 1, MPI_INT, n_candidates_per_rank.data(), 1, MPI_INT, 0, mpi_comm);
-
-    std::vector<int> offsets(n_ranks, 0);
-    std::vector<detail::BondCandidate> all_candidates;
-    if (is_root)
-        {
-        for (unsigned int rank = 1; rank < n_ranks; ++rank)
-            {
-            offsets[rank] = offsets[rank - 1] + n_candidates_per_rank[rank - 1];
-            }
-        all_candidates.resize(offsets[n_ranks - 1] + n_candidates_per_rank[n_ranks - 1]);
-        }
-
-    MPI_Gatherv(m_candidates.data(),
-                n_candidates,
+    MPI_Gatherv(is_root ? MPI_IN_PLACE : m_candidates.data(),
+                static_cast<int>(n_candidates),
                 mpi_candidate,
-                all_candidates.data(),
+                is_root ? m_candidates.data() : nullptr,
                 n_candidates_per_rank.data(),
                 offsets.data(),
                 mpi_candidate,
@@ -333,25 +373,26 @@ void DynamicBondUpdater::gatherBondCandidates()
                 mpi_comm);
     MPI_Type_free(&mpi_candidate);
 
-    m_candidates.clear();
     if (!is_root)
         {
+        m_candidates.clear();
         return;
         }
 
     // partial candidates for the same pair are adjacent after sorting by tags
-    std::sort(all_candidates.begin(), all_candidates.end(), detail::CompareBondCandidatesByTags());
-    auto first = all_candidates.begin();
-    while (first != all_candidates.end())
+    std::sort(m_candidates.begin(), m_candidates.end(), detail::CompareBondCandidatesByTags());
+    auto first = m_candidates.begin();
+    auto output = first;
+    while (first != m_candidates.end())
         {
         detail::BondCandidate merged = *first;
         auto next = first + 1;
-        while (next != all_candidates.end() && next->tag_1 == merged.tag_1
+        while (next != m_candidates.end() && next->tag_1 == merged.tag_1
                && next->tag_2 == merged.tag_2)
             {
-            // an unknown number of free bonds is larger than any known number
-            merged.free_bonds_1 = std::min(merged.free_bonds_1, next->free_bonds_1);
-            merged.free_bonds_2 = std::min(merged.free_bonds_2, next->free_bonds_2);
+            // A known capacity is positive, so it replaces the zero for a remote particle.
+            merged.free_bonds_1 = std::max(merged.free_bonds_1, next->free_bonds_1);
+            merged.free_bonds_2 = std::max(merged.free_bonds_2, next->free_bonds_2);
             merged.r_sq = std::min(merged.r_sq, next->r_sq);
             ++next;
             }
@@ -359,11 +400,12 @@ void DynamicBondUpdater::gatherBondCandidates()
         if (merged.free_bonds_1 != detail::UNKNOWN_FREE_BONDS
             && merged.free_bonds_2 != detail::UNKNOWN_FREE_BONDS)
             {
-            m_candidates.push_back(merged);
+            *output++ = merged;
             }
         first = next;
         }
 
+    m_candidates.erase(output, m_candidates.end());
     std::sort(m_candidates.begin(), m_candidates.end(), detail::CompareBondCandidatesByDistance());
     }
 #endif // ENABLE_MPI
@@ -374,6 +416,11 @@ void DynamicBondUpdater::gatherBondCandidates()
  */
 void DynamicBondUpdater::selectBonds()
     {
+    if (m_candidates.empty())
+        {
+        return;
+        }
+
     m_num_new_bonds.resize(m_pdata->getRTags().size(), 0);
     for (const auto& candidate : m_candidates)
         {
@@ -419,6 +466,13 @@ void DynamicBondUpdater::formBonds(uint64_t timestep)
 
 void DynamicBondUpdater::checkGroups()
     {
+    // Identical filters normally share a ParticleGroup, including when that group is empty.
+    if (m_group_1 == m_group_2)
+        {
+        m_groups_identical = true;
+        return;
+        }
+
     const unsigned int n_common = m_group_1->intersectionSize(m_group_2);
     if (n_common == 0)
         {
@@ -458,13 +512,14 @@ void DynamicBondUpdater::updateRCutMatrix()
     auto find_types = [&](ParticleGroup& group)
     {
         std::vector<unsigned int> has_type(n_types, 0);
+        const unsigned int num_members = group.getNumMembers();
         ArrayHandle<unsigned int> h_members(group.getIndexArray(),
                                             access_location::host,
                                             access_mode::read);
         ArrayHandle<Scalar4> h_pos(m_pdata->getPositions(),
                                    access_location::host,
                                    access_mode::read);
-        for (unsigned int member = 0; member < group.getNumMembers(); ++member)
+        for (unsigned int member = 0; member < num_members; ++member)
             {
             const Scalar4 postype = h_pos.data[h_members.data[member]];
             has_type[__scalar_as_int(postype.w)] = 1;
@@ -474,7 +529,11 @@ void DynamicBondUpdater::updateRCutMatrix()
 
     // the groups may be the same object, so their arrays are accessed one at a time
     std::vector<unsigned int> has_type_1 = find_types(*m_group_1);
-    std::vector<unsigned int> has_type_2 = find_types(*m_group_2);
+    std::vector<unsigned int> has_type_2;
+    if (!m_groups_identical)
+        {
+        has_type_2 = find_types(*m_group_2);
+        }
 
 #ifdef ENABLE_MPI
     if (m_sysdef->isDomainDecomposed())
@@ -485,14 +544,22 @@ void DynamicBondUpdater::updateRCutMatrix()
                       MPI_UNSIGNED,
                       MPI_MAX,
                       m_exec_conf->getMPICommunicator());
-        MPI_Allreduce(MPI_IN_PLACE,
-                      has_type_2.data(),
-                      n_types,
-                      MPI_UNSIGNED,
-                      MPI_MAX,
-                      m_exec_conf->getMPICommunicator());
+        if (!m_groups_identical)
+            {
+            MPI_Allreduce(MPI_IN_PLACE,
+                          has_type_2.data(),
+                          n_types,
+                          MPI_UNSIGNED,
+                          MPI_MAX,
+                          m_exec_conf->getMPICommunicator());
+            }
         }
 #endif // ENABLE_MPI
+
+    if (m_groups_identical)
+        {
+        has_type_2 = has_type_1;
+        }
 
         {
         const Index2D& typpair_idx = m_nlist->getTypePairIndexer();

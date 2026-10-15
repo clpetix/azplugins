@@ -38,8 +38,8 @@ cudaError_t set_bonding_state(unsigned int* d_group_ids,
                               const Index2D& bond_table_indexer,
                               const unsigned int block_size);
 
-//! Count the candidate bonds of each local particle
-cudaError_t count_bond_candidates(unsigned int* d_n_candidates,
+//! Count candidates into entries 1 through N of an N+1 offset array, with entry 0 set to zero
+cudaError_t count_bond_candidates(size_t* d_offsets,
                                   const detail::BondCandidateFinder& find_candidate,
                                   const unsigned int* d_n_neigh,
                                   const unsigned int* d_nlist,
@@ -48,14 +48,11 @@ cudaError_t count_bond_candidates(unsigned int* d_n_candidates,
                                   const unsigned int block_size);
 
 //! Compute where the candidates of each particle start in a compact array
-unsigned int scan_bond_candidates(unsigned int* d_offsets,
-                                  const unsigned int* d_n_candidates,
-                                  const unsigned int N,
-                                  CachedAllocator& alloc);
+size_t scan_bond_candidates(size_t* d_offsets, const unsigned int N, CachedAllocator& alloc);
 
 //! Write the candidate bonds of each local particle to a compact array
 cudaError_t write_bond_candidates(detail::BondCandidate* d_candidates,
-                                  const unsigned int* d_offsets,
+                                  const size_t* d_offsets,
                                   const detail::BondCandidateFinder& find_candidate,
                                   const unsigned int* d_n_neigh,
                                   const unsigned int* d_nlist,
@@ -65,7 +62,7 @@ cudaError_t write_bond_candidates(detail::BondCandidate* d_candidates,
 
 //! Sort candidate bonds by priority
 cudaError_t sort_bond_candidates(detail::BondCandidate* d_candidates,
-                                 const unsigned int num_candidates,
+                                 const size_t num_candidates,
                                  CachedAllocator& alloc);
 
     } // end namespace gpu

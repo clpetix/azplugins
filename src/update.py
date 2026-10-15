@@ -23,7 +23,7 @@ class DynamicBond(hoomd.operation.Updater):
         nlist (hoomd.md.nlist.NeighborList): Neighbor list used to find pairs
             of particles.
         bond_type (str): Type of bond to form.
-        r_cut (float): Cutoff distance for forming a bond
+        r_cut (float): Finite, positive cutoff distance for forming a bond
             :math:`[\mathrm{length}]`.
         filter_1 (hoomd.filter.ParticleFilter): First group of particles.
         filter_2 (hoomd.filter.ParticleFilter): Second group of particles.
@@ -31,8 +31,8 @@ class DynamicBond(hoomd.operation.Updater):
             a particle in the first group.
         max_bonds_2 (int): Maximum number of bonds of type ``bond_type`` for
             a particle in the second group.
-        probability (float): Probability to form a bond between a pair of
-            particles that are close enough.
+        probability (float): Probability between 0 and 1 to form a bond between
+            a pair of particles that are close enough.
 
     `DynamicBond` forms bonds of type ``bond_type`` between particles in the
     first group and particles in the second group that are closer than
@@ -56,8 +56,10 @@ class DynamicBond(hoomd.operation.Updater):
     new bonds are also excluded from the neighbor list.
 
     The random number that decides if a pair of particles forms a bond depends
-    on the timestep, `hoomd.Simulation.seed`, and the tags of the particles, so
-    the same bonds form for any number of MPI ranks.
+    on the timestep, `hoomd.Simulation.seed`, and the tags of the particles.
+    These random draws are independent of the device and MPI domain
+    decomposition. Floating point roundoff can affect the order of pairs with
+    nearly equal distances or pairs very close to ``r_cut``.
 
     Example::
 
@@ -90,10 +92,10 @@ class DynamicBond(hoomd.operation.Updater):
 
     .. warning::
 
-        If the particles selected by the filters change during a simulation
-        (for example, using `hoomd.update.FilterUpdater`), the groups must
-        still contain the same particles or have no particles in common, and
-        the particle types in each group must not change.
+        The filter selections and the particle types in each group must remain
+        fixed while the updater is attached. Remove the updater before changing
+        them (for example, using `hoomd.update.FilterUpdater`), then reattach it
+        to refresh the group checks and neighbor list cutoffs.
 
     Attributes:
         nlist (hoomd.md.nlist.NeighborList): Neighbor list used to find pairs

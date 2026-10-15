@@ -165,7 +165,7 @@ class PYBIND11_EXPORT DynamicBondUpdater : public Updater
     //! Compute the group and number of free bonds of each local particle
     virtual void computeBondingState();
 
-    //! Find candidate bonds involving local particles, sorted by priority
+    //! Find candidate bonds, sorted by priority when not domain decomposed
     virtual void findBondCandidates(uint64_t timestep);
 
     private:

@@ -28,8 +28,9 @@ namespace azplugins
 /*!
  * See DynamicBondUpdater for details. The bonding state of the particles and the candidate bonds
  * are found on the GPU. The candidates of each particle are counted first so that they can be
- * written to a compact array, which is then sorted by priority on the GPU. The bonds are selected
- * from the sorted candidates on the CPU.
+ * written to a compact array. On one rank, the candidates are sorted by priority on the GPU.
+ * With domain decomposition, they are gathered, merged, and sorted on the root rank instead.
+ * The bonds are selected from the sorted candidates on the CPU.
  */
 class PYBIND11_EXPORT DynamicBondUpdaterGPU : public DynamicBondUpdater
     {
@@ -50,7 +51,7 @@ class PYBIND11_EXPORT DynamicBondUpdaterGPU : public DynamicBondUpdater
     //! Compute the group and number of free bonds of each local particle
     void computeBondingState() override;
 
-    //! Find candidate bonds involving local particles, sorted by priority
+    //! Find candidate bonds, sorted by priority when not domain decomposed
     void findBondCandidates(uint64_t timestep) override;
 
     private:
@@ -58,8 +59,7 @@ class PYBIND11_EXPORT DynamicBondUpdaterGPU : public DynamicBondUpdater
     std::shared_ptr<Autotuner<1>> m_tuner_count; //!< Tuner for counting candidates
     std::shared_ptr<Autotuner<1>> m_tuner_write; //!< Tuner for writing candidates
 
-    GPUVector<unsigned int> m_n_candidates;      //!< Number of candidates of each particle
-    GPUVector<unsigned int> m_candidate_offsets; //!< First index of each particle's candidates
+    GPUVector<size_t> m_candidate_offsets; //!< Candidate offsets, with the total in the last entry
     GPUVector<detail::BondCandidate> m_gpu_candidates; //!< Candidates on the GPU
     };
 
