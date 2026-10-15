@@ -4,234 +4,198 @@
 
 """Updaters."""
 
-import hoomd
+import copy
+import warnings
 
+import hoomd
 from hoomd.azplugins import _azplugins
 from hoomd.data.parameterdicts import ParameterDict
-from hoomd.data.typeconverter import OnlyTypes
+from hoomd.data.typeconverter import positive_int, positive_real
+from hoomd.md import _md
 
 
 class DynamicBond(hoomd.operation.Updater):
-    R"""Update bonds dynamically during simulation.
+    r"""Form bonds dynamically between nearby particles.
 
     Args:
-        r_cut (float): Distance cutoff for making bonds between particles
-        trigger (:py:mod: `hoomd.trigger.Trigger`): The trigger to activate this updater
-        bond_type (str): Type of bond to be formed
-        groups (list of :py:mod: `hoomd.filter.ParticleFilter`): particle groups
-        max_bonds (list of int): Maximum number of bonds particles can have
-        probability (float, optional): Probability of bond formation, between 0 and 1,
-                                       default = 1
-        seed (int, optional): Seed for the number generator for bond formation
-                              probability checking, default = 0
+        trigger (hoomd.trigger.trigger_like): Select the timesteps to form
+            bonds.
+        nlist (hoomd.md.nlist.NeighborList): Neighbor list used to find pairs
+            of particles.
+        bond_type (str): Type of bond to form.
+        r_cut (float): Cutoff distance for forming a bond
+            :math:`[\mathrm{length}]`.
+        filter_1 (hoomd.filter.ParticleFilter): First group of particles.
+        filter_2 (hoomd.filter.ParticleFilter): Second group of particles.
+        max_bonds_1 (int): Maximum number of bonds of type ``bond_type`` for
+            a particle in the first group.
+        max_bonds_2 (int): Maximum number of bonds of type ``bond_type`` for
+            a particle in the second group.
+        probability (float): Probability to form a bond between a pair of
+            particles that are close enough.
 
-        nlist (:py:mod:`hoomd.md.nlist`, optional): NeighborList (optional) to update
-                                                    exclusions
+    `DynamicBond` forms bonds of type ``bond_type`` between particles in the
+    first group and particles in the second group that are closer than
+    ``r_cut``. Each time the updater runs, it finds the pairs of particles that
+    are close enough and are not already bonded to each other by a bond of any
+    type. Each pair is considered for bonding with ``probability``. The pairs
+    are processed in order of increasing distance, using the particle tags to
+    break ties, and a bond is formed if both particles have fewer bonds of type
+    ``bond_type`` than their maximum. Bonds of other types do not count toward
+    the maximum number of bonds.
 
-    Forms bonds of type bond_type between particles in the groups=[group_1,group_2]
-    during the simulation, if particle distances are shorter than r_cut. If the
-    neighborlist used for the pair potential in the simulation is given as a
-    parameter nlist, the neighbor list exclusions will be updated to include the
-    newly formed bonds. Each particle has a number of maximum bonds which it can
-    form, given by max_bonds=[max_bonds_1,max_bonds_2] for particles in group_1 and
-    max_bonds_2 for group_2.
+    The two groups must either contain the same particles or have no particles
+    in common. When the groups contain the same particles, bonds are formed
+    between particles in that group, and ``max_bonds_1`` and ``max_bonds_2``
+    must be equal.
 
-    The particles in the two groups group_1 and group_2 should be completely
-    separate with no common elements, e.g. two different types. Alternatively, only
-    one element in the groups list and only one element in the max_bonds list can
-    be given, then the bonds will be formed within that given group.
+    `DynamicBond` adds ``r_cut`` to the cutoff of ``nlist`` for the pairs of
+    particle types in the two groups, so the neighbor list can be shared with a
+    pair potential. Pairs of particles that are excluded from the neighbor list
+    are never bonded. If ``"bond"`` is one of the neighbor list exclusions,
+    new bonds are also excluded from the neighbor list.
 
-    .. warning::
-        If the groups group_1 or group_2 are modified during the simulation, this
-        Updater will not be updated to reflect the changes. It is the user's
-        responsibility to ensure that the groups do not change as long as this
-        updater is active.
+    The random number that decides if a pair of particles forms a bond depends
+    on the timestep, `hoomd.Simulation.seed`, and the tags of the particles, so
+    the same bonds form for any number of MPI ranks.
 
-    .. warning::
-        This updater is not implemeted for MPI.
+    Example::
 
-    Examples::
+        nlist = hoomd.md.nlist.Cell(buffer=0.4)
+        dynamic_bond = hoomd.azplugins.update.DynamicBond(
+            trigger=hoomd.trigger.Periodic(100),
+            nlist=nlist,
+            bond_type="A-B",
+            r_cut=1.2,
+            filter_1=hoomd.filter.Type(["A"]),
+            filter_2=hoomd.filter.Type(["B"]),
+            max_bonds_1=1,
+            max_bonds_2=2,
+            probability=0.5,
+        )
+        simulation.operations.updaters.append(dynamic_bond)
 
-        azplugins.update.dynamic_bond(
-            nlist=nl,
-            r_cut=1.0,
-            bond_type=0,
-            probability=0.8,
-            groups=[hoomd.group.type(type="A"), hoomd.group.type(type="B")],
-            max_bonds=[2, 3],
+    Bonds between particles of the same type::
+
+        dynamic_bond = hoomd.azplugins.update.DynamicBond(
+            trigger=hoomd.trigger.Periodic(100),
+            nlist=nlist,
+            bond_type="A-A",
+            r_cut=1.2,
+            filter_1=hoomd.filter.Type(["A"]),
+            filter_2=hoomd.filter.Type(["A"]),
+            max_bonds_1=2,
+            max_bonds_2=2,
         )
 
-        azplugins.update.dynamic_bond(
-            r_cut=1.0,
-            bond_type=0,
-            groups=[hoomd.group.type(type="A")],
-            max_bonds=[2],
-        )
+    .. warning::
+
+        If the particles selected by the filters change during a simulation
+        (for example, using `hoomd.update.FilterUpdater`), the groups must
+        still contain the same particles or have no particles in common, and
+        the particle types in each group must not change.
+
+    Attributes:
+        nlist (hoomd.md.nlist.NeighborList): Neighbor list used to find pairs
+            of particles (*read only*).
+
+        bond_type (str): Type of bond to form.
+
+        r_cut (float): Cutoff distance for forming a bond
+            :math:`[\mathrm{length}]`.
+
+        filter_1 (hoomd.filter.ParticleFilter): First group of particles
+            (*read only*).
+
+        filter_2 (hoomd.filter.ParticleFilter): Second group of particles
+            (*read only*).
+
+        max_bonds_1 (int): Maximum number of bonds of type ``bond_type`` for a
+            particle in the first group.
+
+        max_bonds_2 (int): Maximum number of bonds of type ``bond_type`` for a
+            particle in the second group.
+
+        probability (float): Probability to form a bond between a pair of
+            particles that are close enough.
+
     """
-
-    _ext_module = _azplugins
-    _cpp_class_name = "DynamicBondUpdater"
 
     def __init__(
         self,
         trigger,
-        groups,
-        max_bonds,
+        nlist,
         bond_type,
-        nlist=None,
-        r_cut=1.0,
-        seed=0,
+        r_cut,
+        filter_1,
+        filter_2,
+        max_bonds_1,
+        max_bonds_2,
         probability=1.0,
     ):
         super().__init__(trigger)
 
-        params = ParameterDict(
-            r_cut=OnlyTypes(float, allow_none=False),
-            nlist=OnlyTypes(hoomd.md.nlist.NeighborList, strict=True, allow_none=True),
-            groups=list(groups),
-            max_bonds=list(max_bonds),
-            bond_type=OnlyTypes(int, strict=True, allow_none=False),
-            seed=OnlyTypes(int, strict=True, allow_none=False),
-            probability=OnlyTypes(float, strict=False, allow_none=True),
+        param_dict = ParameterDict(
+            nlist=hoomd.md.nlist.NeighborList,
+            bond_type=str,
+            r_cut=positive_real,
+            filter_1=hoomd.filter.ParticleFilter,
+            filter_2=hoomd.filter.ParticleFilter,
+            max_bonds_1=positive_int,
+            max_bonds_2=positive_int,
+            probability=float,
         )
-
-        params.update(
+        param_dict.update(
             dict(
-                r_cut=r_cut,
                 nlist=nlist,
-                groups=groups,
-                max_bonds=max_bonds,
                 bond_type=bond_type,
-                seed=seed,
+                r_cut=r_cut,
+                filter_1=filter_1,
+                filter_2=filter_2,
+                max_bonds_1=max_bonds_1,
+                max_bonds_2=max_bonds_2,
                 probability=probability,
             )
         )
-
-        self._param_dict.update(params)
-
-    def _parse_groups(self, vec_groups, vec_max_bonds, sim):
-        """Converts Groups depending if there is one or two given.
-
-        Args:
-            vec_groups (Sequence[filter]): A sequence of length 2 or 1 of
-                                           type ``hoomd.filter.ParticleFilter``.
-            vec_max_bonds(Sequence[int]): A sequence of length 2 or 1 of type ``int``.
-            sim: Simulation state.
-        """
-        try:
-            l_vec = len(vec_groups)
-        except TypeError:
-            raise ValueError(
-                "Expected array of hoomd.filter.ParticleFilter for\
-                              argument `groups`."
-            )
-        if l_vec == 1:
-            if isinstance(vec_groups[0], hoomd.filter.ParticleFilter):
-                self.group_1 = sim.state._get_group(vec_groups[0])
-                self.group_2 = sim.state._get_group(vec_groups[0])
-                self._param_dict["group_1"] = self.group_1
-                self._param_dict["group_2"] = self.group_2
-                if len(vec_max_bonds) != 1:
-                    raise ValueError(
-                        "Expected array[int] of same length as `groups`\
-                                      for argument `max_bonds`."
-                    )
-                else:
-                    self.max_bonds_group_1 = vec_max_bonds[0]
-                    self._param_dict["max_bonds_group_1"] = vec_max_bonds[0]
-                    self.max_bonds_group_2 = vec_max_bonds[0]
-                    self._param_dict["max_bonds_group_2"] = vec_max_bonds[0]
-            else:
-                raise ValueError(
-                    "Expected array of hoomd.filter.ParticleFilter for\
-                                  argument `groups`."
-                )
-        elif l_vec == 2:
-            if isinstance(vec_groups[0], hoomd.filter.ParticleFilter) and isinstance(
-                vec_groups[1], hoomd.filter.ParticleFilter
-            ):
-                self.group_1 = sim.state._get_group(vec_groups[0])
-                self.group_2 = sim.state._get_group(vec_groups[1])
-                self._param_dict["group_1"] = self.group_1
-                self._param_dict["group_2"] = self.group_2
-                if len(vec_max_bonds) != 2:
-                    raise ValueError(
-                        "Expected array[int] of same length as `groups`\
-                                      for argument `max_bonds`."
-                    )
-                else:
-                    self.max_bonds_group_1 = vec_max_bonds[0]
-                    self._param_dict["max_bonds_group_1"] = vec_max_bonds[0]
-                    self.max_bonds_group_2 = vec_max_bonds[1]
-                    self._param_dict["max_bonds_group_2"] = vec_max_bonds[1]
-            else:
-                raise ValueError(
-                    "Expected array of hoomd.filter.ParticleFilter for\
-                                  argument `groups`."
-                )
-        else:
-            raise ValueError(
-                "Expected an array of one or two hoomd.filter.ParticleFilter for\
-                      argument `groups`."
-            )
-
-    @property
-    def bond_type(self):
-        """bond_type (int): Type of the bonds that are made by this updater."""
-        return self._cpp_obj.bond_type
-
-    @bond_type.setter
-    def bond_type(self, value):
-        if value is not None:
-            self._param_dict["bond_type"] = value
-            self._cpp_obj.setBondType(value)
-
-    @property
-    def probability(self):
-        """Probability (float): Probability of forming bonds. Value between 0 and 1."""
-        return self._cpp_obj.probability
-
-    @probability.setter
-    def probability(self, value):
-        self._param_dict["probability"] = value
-        self._cpp_obj.probability = value
-
-    @property
-    def r_cut(self):
-        """r_cut (float): Distance cutoff for making bonds between particles."""
-        return self._cpp_obj.r_cut
-
-    @r_cut.setter
-    def r_cut(self, value):
-        self._cpp_obj.r_cut = value
-        self._param_dict["r_cut"] = value
+        self._param_dict.update(param_dict)
 
     def _attach_hook(self):
-        """Create the c++ mirror class."""
         sim = self._simulation
 
-        if isinstance(self._simulation.device, hoomd.device.CPU):
-            cpp_class = getattr(self._ext_module, self._cpp_class_name)
-        else:
-            cpp_class = getattr(self._ext_module, self._cpp_class_name + "GPU")
+        # attach the neighbor list in the same way as the pair potentials
+        if self.nlist._attached and sim != self.nlist._simulation:
+            warnings.warn(
+                f"{self} object is creating a new equivalent neighbor list."
+                f" This is happening since the updater is moving to a new "
+                f"simulation. Set a new nlist to suppress this warning.",
+                RuntimeWarning,
+            )
+            self.nlist = copy.deepcopy(self.nlist)
+        self.nlist._attach(sim)
 
-        self._parse_groups(self.groups, self.max_bonds, sim)
+        if isinstance(sim.device, hoomd.device.GPU):
+            cpp_class = _azplugins.DynamicBondUpdaterGPU
+            self.nlist._cpp_obj.setStorageMode(_md.NeighborList.storageMode.full)
+        else:
+            cpp_class = _azplugins.DynamicBondUpdater
+
+        # bonds are formed randomly using the simulation seed
+        sim._warn_if_seed_unset()
 
         self._cpp_obj = cpp_class(
             sim.state._cpp_sys_def,
             self.trigger,
-            self.group_1,
-            self.group_2,
-            self.seed,
-            self.r_cut,
-            self.probability,
-            self.max_bonds_group_1,
-            self.max_bonds_group_2,
+            self.nlist._cpp_obj,
+            sim.state._get_group(self.filter_1),
+            sim.state._get_group(self.filter_2),
             self.bond_type,
+            self.r_cut,
+            self.max_bonds_1,
+            self.max_bonds_2,
+            self.probability,
         )
 
-        if self.nlist is not None:
-            self.nlist._attach(sim)
-            self._cpp_obj.setNlist(self.nlist._cpp_obj)
-
         super()._attach_hook()
+
+    def _detach_hook(self):
+        self.nlist._detach()

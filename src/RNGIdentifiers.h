@@ -10,6 +10,8 @@
 #ifndef AZPLUGINS_RNG_IDENTIFIERS_H_
 #define AZPLUGINS_RNG_IDENTIFIERS_H_
 
+#include <cstdint>
+
 namespace hoomd
     {
 namespace azplugins

@@ -2,385 +2,278 @@
 // Copyright (c) 2021-2025, Auburn University
 // Part of azplugins, released under the BSD 3-Clause License.
 
-// Maintainer: astatt
-
 /*!
  * \file DynamicBondUpdaterGPU.cu
  * \brief Definition of kernel drivers and kernels for DynamicBondUpdaterGPU
  */
 
 #include "DynamicBondUpdaterGPU.cuh"
-#include "hoomd/HOOMDMath.h"
-#include "hoomd/md/NeighborListGPUTree.cuh"
 
-#include <thrust/device_vector.h>
+#include <thrust/device_ptr.h>
+#include <thrust/execution_policy.h>
 #include <thrust/reduce.h>
-#include <thrust/remove.h>
+#include <thrust/scan.h>
 #include <thrust/sort.h>
-#include <thrust/unique.h>
 
 namespace hoomd
     {
 namespace azplugins
     {
-
-// this sorts according distance, then first tag, then second tag
-struct SortBondsGPU
-    {
-    __host__ __device__ bool operator()(const Scalar3& i, const Scalar3& j)
-        {
-        const Scalar r_sq_1 = i.z;
-        const Scalar r_sq_2 = j.z;
-        if (r_sq_1 == r_sq_2)
-            {
-            const unsigned int tag_11 = __scalar_as_int(i.x);
-            const unsigned int tag_21 = __scalar_as_int(j.x);
-            if (tag_11 == tag_21)
-                {
-                const unsigned int tag_12 = __scalar_as_int(i.y);
-                const unsigned int tag_22 = __scalar_as_int(j.y);
-                return tag_22 > tag_12;
-                }
-            else
-                {
-                return tag_21 > tag_11;
-                }
-            }
-        else
-            {
-            return r_sq_2 > r_sq_1;
-            }
-        }
-    };
-
-// returns true if given possible bond is zero, e.g. (0,0,0.0)
-// possible bonds are ordered, such that tag_a < tag_b in (tag_a,tag_b,rsq)
-// meaning we only need to check tag_b == 0
-struct isZeroBondGPU
-    {
-    __host__ __device__ bool operator()(const Scalar3& i)
-        {
-        const unsigned int tag_1 = __scalar_as_int(i.y);
-        return !(bool)tag_1;
-        }
-    };
-
-struct CompareBondsGPU
-    {
-    __host__ __device__ bool operator()(const Scalar3& i, const Scalar3& j)
-        {
-        const unsigned int tag_11 = __scalar_as_int(i.x);
-        const unsigned int tag_12 = __scalar_as_int(i.y);
-        const unsigned int tag_21 = __scalar_as_int(j.x);
-        const unsigned int tag_22 = __scalar_as_int(j.y);
-
-        if ((tag_11 == tag_21 && tag_12 == tag_22)) // should work because pairs are ordered
-            {
-            return true;
-            }
-        else
-            {
-            return false;
-            }
-        }
-    };
-
 namespace gpu
     {
-
-//! Number of elements of the exclusion list to process in each batch
-const unsigned int FILTER_BATCH_SIZE = 4;
-
 namespace kernel
     {
-
-__global__ void copy_nlist_possible_bonds(Scalar3* d_all_possible_bonds,
-                                          const Scalar4* d_postype,
-                                          const unsigned int* d_tag,
-                                          const unsigned int* d_sorted_indexes,
-                                          const unsigned int* d_sorted_indexes_group_2,
-                                          const unsigned int* d_n_neigh,
-                                          const unsigned int* d_nlist,
-                                          const size_t* d_n_head_list,
-                                          const BoxDim box,
-                                          const unsigned int max_bonds,
-                                          const Scalar r_cut,
-                                          const bool groups_identical,
-                                          const unsigned int size_group_2,
-                                          const unsigned int N)
+/*!
+ * \param d_group_ids Group of each local particle
+ * \param d_free_bonds Number of free bonds of each local particle
+ * \param d_members Indexes of the particles in the group
+ * \param num_members Number of particles in the group
+ * \param group_id Group of the particles (1 or 2)
+ * \param max_bonds Maximum number of bonds of the particles
+ * \param bond_type Type of bonds to count
+ * \param d_bond_table Bonds of each particle
+ * \param d_n_bonds Number of bonds of each particle
+ * \param bond_table_indexer Indexer into \a d_bond_table
+ *
+ * One thread is used per particle in the group.
+ */
+__global__ void set_bonding_state(unsigned int* d_group_ids,
+                                  unsigned int* d_free_bonds,
+                                  const unsigned int* d_members,
+                                  const unsigned int num_members,
+                                  const unsigned int group_id,
+                                  const unsigned int max_bonds,
+                                  const unsigned int bond_type,
+                                  const group_storage<2>* d_bond_table,
+                                  const unsigned int* d_n_bonds,
+                                  const Index2D bond_table_indexer)
     {
-    // one thread per particle in group_1
-    const unsigned int idx = blockDim.x * blockIdx.x + threadIdx.x;
-
-    if (idx >= N)
+    const unsigned int member = blockIdx.x * blockDim.x + threadIdx.x;
+    if (member >= num_members)
         return;
 
-    // idx = group index , pidx = actual particle index
-    const unsigned int pidx_i = d_sorted_indexes[idx];
-    unsigned int n_curr_bond = 0;
-    const Scalar r_cutsq = r_cut * r_cut;
+    const unsigned int idx = d_members[member];
+    d_group_ids[idx] = group_id;
+    d_free_bonds[idx] = detail::countFreeBonds(idx,
+                                               max_bonds,
+                                               bond_type,
+                                               d_bond_table,
+                                               d_n_bonds,
+                                               bond_table_indexer);
+    }
 
-    // get all information for this particle
-    Scalar4 postype_i = d_postype[pidx_i];
-    const unsigned int tag_i = d_tag[pidx_i];
-    const unsigned int n_neigh = d_n_neigh[pidx_i];
-    const size_t head = d_n_head_list[pidx_i];
+/*!
+ * \param d_n_candidates Number of candidates of each particle (output, or nullptr)
+ * \param d_candidates Compact array of candidates (output, or nullptr)
+ * \param d_offsets First index of each particle's candidates in \a d_candidates
+ * \param find_candidate Finder for candidate bonds
+ * \param d_n_neigh Number of neighbors of each particle
+ * \param d_nlist Neighbor list
+ * \param d_head_list Start of each particle's neighbors in \a d_nlist
+ * \param N Number of local particles
+ *
+ * One thread is used per local particle. The candidates are counted if \a d_n_candidates is not
+ * null, and they are written if \a d_candidates is not null. The finder is deterministic, so the
+ * same candidates are found when they are counted and when they are written.
+ */
+__global__ void find_bond_candidates(unsigned int* d_n_candidates,
+                                     detail::BondCandidate* d_candidates,
+                                     const unsigned int* d_offsets,
+                                     const detail::BondCandidateFinder find_candidate,
+                                     const unsigned int* d_n_neigh,
+                                     const unsigned int* d_nlist,
+                                     const size_t* d_head_list,
+                                     const unsigned int N)
+    {
+    const unsigned int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= N)
+        return;
 
-    // loop over all neighbors of this particle
-    for (unsigned int j = 0; j < n_neigh; ++j)
+    unsigned int n_candidates = 0;
+    if (find_candidate.canBond(i))
         {
-        // get index of neighbor from neigh_list
-        const unsigned int pidx_j = d_nlist[head + j];
-
-        // test if j is in group 2
-
-        // wrapper for pointer needed for thrust
-        thrust::device_ptr<const unsigned int> d_sorted_indexes_group_2_wrap(
-            d_sorted_indexes_group_2);
-
-        auto iter = thrust::find(thrust::device,
-                                 d_sorted_indexes_group_2_wrap,
-                                 d_sorted_indexes_group_2_wrap + size_group_2,
-                                 pidx_j);
-
-        if (iter != d_sorted_indexes_group_2_wrap + size_group_2)
+        const size_t head = d_head_list[i];
+        const unsigned int n_neigh = d_n_neigh[i];
+        for (unsigned int neigh = 0; neigh < n_neigh; ++neigh)
             {
-            Scalar4 postype_j = d_postype[pidx_j];
-            const unsigned int tag_j = d_tag[pidx_j];
-
-            Scalar3 drij = make_scalar3(postype_j.x, postype_j.y, postype_j.z)
-                           - make_scalar3(postype_i.x, postype_i.y, postype_i.z);
-
-            // apply periodic boundary conditions (FLOPS: 12)
-            drij = box.minImage(drij);
-
-            // same as on the cpu, just not during the tree traversal
-            Scalar dr_sq = dot(drij, drij);
-
-            if (dr_sq < r_cutsq)
+            detail::BondCandidate candidate;
+            if (find_candidate(candidate, i, d_nlist[head + neigh]))
                 {
-                if (n_curr_bond < max_bonds)
+                if (d_candidates)
                     {
-                    Scalar3 d;
-                    if (groups_identical)
-                        {
-                        // sort the two tags in this possible bond pair if groups are identical
-                        const unsigned int tag_a = tag_j > tag_i ? tag_i : tag_j;
-                        const unsigned int tag_b = tag_j > tag_i ? tag_j : tag_i;
-                        d = make_scalar3(__int_as_scalar(tag_a), __int_as_scalar(tag_b), dr_sq);
-                        }
-                    else
-                        {
-                        d = make_scalar3(__int_as_scalar(tag_i), __int_as_scalar(tag_j), dr_sq);
-                        }
-                    d_all_possible_bonds[idx * max_bonds + n_curr_bond] = d;
+                    d_candidates[d_offsets[i] + n_candidates] = candidate;
                     }
-                ++n_curr_bond;
+                ++n_candidates;
                 }
             }
         }
-    }
 
-/*! \param d_all_possible_bonds all possible bonds list
-    \param d_n_existing_bonds Number of existing for each particle
-    \param d_existing_bonds_list List of exitsting for each particle
-    \param exli Indexer for indexing into d_existing_bonds_list
-    \param size Length of d_all_possible_bonds
-    \param ex_start Start filtering  d_all_possible_bonds from existing bond number \a ex_start
-
-    the kernel filter_existing_bonds() processes the all possible bonds list \a d_nlist and removes
-   any entries that already exist. To allow for an arbitrary large number of existing bonds, these
-   are processed in batch sizes of FILTER_BATCH_SIZE. The kernel must be called multiple times in
-   order to fully remove all exclusions from the nlist.
-
-    \note The driver filter_existing_bonds properly makes as many calls as are necessary, it only
-   needs to be called once.
-
-    \b Implementation
-
-    One thread is run for each particle. Existing bonds \a ex_start, \a ex_start + 1, ... are loaded
-   in for that particle (or the thread returns if there are no exclusions past that point). The
-   thread then loops over the neighbor list, comparing each entry to the list of exclusions. If the
-   entry is not excluded, it is written back out. \a d_n_neigh is updated to reflect the current
-   number of particles in the list at the end of the kernel call.
-*/
-__global__ void filter_existing_bonds(Scalar3* d_all_possible_bonds,
-                                      const unsigned int* d_n_existing_bonds,
-                                      const unsigned int* d_existing_bonds_list,
-                                      const Index2D exli,
-                                      const unsigned int size,
-                                      const unsigned int ex_start)
-    {
-    // compute the bond index this thread operates on
-    const unsigned int idx = blockDim.x * blockIdx.x + threadIdx.x;
-
-    // quit now if this thread is processing past the end of the list of all possible bonds
-    if (idx >= size)
-        return;
-
-    Scalar3 current_bond = d_all_possible_bonds[idx];
-    unsigned int tag_1 = __scalar_as_int(current_bond.x);
-    unsigned int tag_2 = __scalar_as_int(current_bond.y);
-
-    if (tag_1 == 0 && tag_2 == 0)
-        return;
-
-    // const unsigned int n_neigh = d_n_neigh[idx];
-    const unsigned int n_ex = d_n_existing_bonds[tag_1];
-
-    // quit now if the ex_start flag is past the end of n_ex
-    if (ex_start >= n_ex)
-        return;
-
-    // count the number of existing bonds to process in this thread
-    const unsigned int n_ex_process = n_ex - ex_start;
-
-    // load the existing bond list into "local" memory - fully unrolled loops should dump this into
-    // registers
-    unsigned int l_existing_bonds_list[FILTER_BATCH_SIZE];
-#pragma unroll
-    for (unsigned int cur_ex_idx = 0; cur_ex_idx < FILTER_BATCH_SIZE; cur_ex_idx++)
+    if (d_n_candidates)
         {
-        if (cur_ex_idx < n_ex_process)
-            {
-            l_existing_bonds_list[cur_ex_idx]
-                = d_existing_bonds_list[exli(tag_1, cur_ex_idx + ex_start)];
-            }
-        else
-            {
-            l_existing_bonds_list[cur_ex_idx] = 0xffffffff;
-            }
-        }
-
-    // test if excluded
-    bool excluded = false;
-#pragma unroll
-    for (unsigned int cur_ex_idx = 0; cur_ex_idx < FILTER_BATCH_SIZE; cur_ex_idx++)
-        {
-        if (tag_2 == l_existing_bonds_list[cur_ex_idx])
-            excluded = true;
-        }
-    // if it is excluded, overwrite that entry with (0,0,0).
-    if (excluded)
-        {
-        d_all_possible_bonds[idx] = make_scalar3(__int_as_scalar(0), __int_as_scalar(0), 0.0);
+        d_n_candidates[i] = n_candidates;
         }
     }
-
     } // end namespace kernel
 
-cudaError_t remove_zeros_and_sort_possible_bond_array(Scalar3* d_all_possible_bonds,
-                                                      const unsigned int size,
-                                                      int* d_max_non_zero_bonds)
+/*!
+ * \param d_group_ids Group of each local particle
+ * \param d_free_bonds Number of free bonds of each local particle
+ * \param d_members Indexes of the particles in the group
+ * \param num_members Number of particles in the group
+ * \param group_id Group of the particles (1 or 2)
+ * \param max_bonds Maximum number of bonds of the particles
+ * \param bond_type Type of bonds to count
+ * \param d_bond_table Bonds of each particle
+ * \param d_n_bonds Number of bonds of each particle
+ * \param bond_table_indexer Indexer into \a d_bond_table
+ * \param block_size Number of threads per block
+ */
+cudaError_t set_bonding_state(unsigned int* d_group_ids,
+                              unsigned int* d_free_bonds,
+                              const unsigned int* d_members,
+                              const unsigned int num_members,
+                              const unsigned int group_id,
+                              const unsigned int max_bonds,
+                              const unsigned int bond_type,
+                              const group_storage<2>* d_bond_table,
+                              const unsigned int* d_n_bonds,
+                              const Index2D& bond_table_indexer,
+                              const unsigned int block_size)
     {
-    if (size == 0)
-        return cudaSuccess;
-    // wrapper for pointer needed for thrust
-    thrust::device_ptr<Scalar3> d_all_possible_bonds_wrap(d_all_possible_bonds);
+    unsigned int max_block_size;
+    cudaFuncAttributes attr;
+    cudaFuncGetAttributes(&attr, (const void*)kernel::set_bonding_state);
+    max_block_size = attr.maxThreadsPerBlock;
 
-    isZeroBondGPU zero;
-    thrust::device_ptr<Scalar3> last0
-        = thrust::remove_if(d_all_possible_bonds_wrap, d_all_possible_bonds_wrap + size, zero);
-    unsigned int l0 = thrust::distance(d_all_possible_bonds_wrap, last0);
-
-    // sort remainder by distance, should make all identical bonds consequtive
-    SortBondsGPU sort;
-    thrust::sort(d_all_possible_bonds_wrap, d_all_possible_bonds_wrap + l0, sort);
-
-    // thrust::unique only removes identical consequtive elements, so sort above is needed.
-    CompareBondsGPU comp;
-    thrust::device_ptr<Scalar3> last1
-        = thrust::unique(d_all_possible_bonds_wrap, d_all_possible_bonds_wrap + l0, comp);
-    unsigned int l1 = thrust::distance(d_all_possible_bonds_wrap, last1);
-
-    *d_max_non_zero_bonds = l1;
+    const unsigned int run_block_size = min(block_size, max_block_size);
+    kernel::set_bonding_state<<<num_members / run_block_size + 1, run_block_size>>>(
+        d_group_ids,
+        d_free_bonds,
+        d_members,
+        num_members,
+        group_id,
+        max_bonds,
+        bond_type,
+        d_bond_table,
+        d_n_bonds,
+        bond_table_indexer);
 
     return cudaSuccess;
     }
 
-cudaError_t filter_existing_bonds(Scalar3* d_all_possible_bonds,
-                                  unsigned int* d_n_existing_bonds,
-                                  const unsigned int* d_existing_bonds_list,
-                                  const Index2D& exli,
-                                  const unsigned int size,
+/*!
+ * \param d_n_candidates Number of candidates of each particle
+ * \param find_candidate Finder for candidate bonds
+ * \param d_n_neigh Number of neighbors of each particle
+ * \param d_nlist Neighbor list
+ * \param d_head_list Start of each particle's neighbors in \a d_nlist
+ * \param N Number of local particles
+ * \param block_size Number of threads per block
+ */
+cudaError_t count_bond_candidates(unsigned int* d_n_candidates,
+                                  const detail::BondCandidateFinder& find_candidate,
+                                  const unsigned int* d_n_neigh,
+                                  const unsigned int* d_nlist,
+                                  const size_t* d_head_list,
+                                  const unsigned int N,
                                   const unsigned int block_size)
     {
-    static unsigned int max_block_size = UINT_MAX;
-    if (max_block_size == UINT_MAX)
-        {
-        cudaFuncAttributes attr;
-        cudaFuncGetAttributes(&attr, (const void*)kernel::filter_existing_bonds);
-        max_block_size = attr.maxThreadsPerBlock;
-        }
+    unsigned int max_block_size;
+    cudaFuncAttributes attr;
+    cudaFuncGetAttributes(&attr, (const void*)kernel::find_bond_candidates);
+    max_block_size = attr.maxThreadsPerBlock;
 
-    unsigned int run_block_size = min(block_size, max_block_size);
-
-    // determine parameters for kernel launch
-    int n_blocks = size / run_block_size + 1;
-
-    // split the processing of the full exclusion list up into a number of batches
-    unsigned int n_batches = (unsigned int)ceil(double(exli.getH()) / double(FILTER_BATCH_SIZE));
-    unsigned int ex_start = 0;
-    for (unsigned int batch = 0; batch < n_batches; batch++)
-        {
-        kernel::filter_existing_bonds<<<n_blocks, run_block_size>>>(d_all_possible_bonds,
-                                                                    d_n_existing_bonds,
-                                                                    d_existing_bonds_list,
-                                                                    exli,
-                                                                    size,
-                                                                    ex_start);
-
-        ex_start += FILTER_BATCH_SIZE;
-        }
+    const unsigned int run_block_size = min(block_size, max_block_size);
+    kernel::find_bond_candidates<<<N / run_block_size + 1, run_block_size>>>(d_n_candidates,
+                                                                             nullptr,
+                                                                             nullptr,
+                                                                             find_candidate,
+                                                                             d_n_neigh,
+                                                                             d_nlist,
+                                                                             d_head_list,
+                                                                             N);
 
     return cudaSuccess;
     }
 
-cudaError_t copy_possible_bonds(Scalar3* d_all_possible_bonds,
-                                const Scalar4* d_postype,
-                                const unsigned int* d_tag,
-                                const unsigned int* d_sorted_indexes,
-                                const unsigned int* d_sorted_indexes_group_2,
-                                const unsigned int* d_n_neigh,
-                                const unsigned int* d_nlist,
-                                const size_t* d_n_head_list,
-                                const BoxDim box,
-                                const unsigned int max_bonds,
-                                const Scalar r_cut,
-                                const bool groups_identical,
-                                const unsigned int size_group_2,
-                                const unsigned int N,
-                                const unsigned int block_size)
+/*!
+ * \param d_offsets First index of each particle's candidates in a compact array
+ * \param d_n_candidates Number of candidates of each particle
+ * \param N Number of local particles
+ * \param alloc Allocator for temporary memory
+ * \returns Total number of candidates
+ */
+unsigned int scan_bond_candidates(unsigned int* d_offsets,
+                                  const unsigned int* d_n_candidates,
+                                  const unsigned int N,
+                                  CachedAllocator& alloc)
     {
-    static unsigned int max_block_size = UINT_MAX;
-
-    if (max_block_size == UINT_MAX)
+    if (N == 0)
         {
-        cudaFuncAttributes attr;
-        cudaFuncGetAttributes(&attr, (const void*)kernel::copy_nlist_possible_bonds);
-        max_block_size = attr.maxThreadsPerBlock;
+        return 0;
         }
-    unsigned int run_block_size = min(block_size, max_block_size);
 
-    kernel::copy_nlist_possible_bonds<<<N / run_block_size + 1, run_block_size>>>(
-        d_all_possible_bonds,
-        d_postype,
-        d_tag,
-        d_sorted_indexes,
-        d_sorted_indexes_group_2,
-        d_n_neigh,
-        d_nlist,
-        d_n_head_list,
-        box,
-        max_bonds,
-        r_cut,
-        groups_identical,
-        size_group_2,
-        N);
+    thrust::device_ptr<const unsigned int> n_candidates(d_n_candidates);
+    thrust::device_ptr<unsigned int> offsets(d_offsets);
+    thrust::exclusive_scan(thrust::cuda::par(alloc), n_candidates, n_candidates + N, offsets);
+    return thrust::reduce(thrust::cuda::par(alloc), n_candidates, n_candidates + N);
+    }
+
+/*!
+ * \param d_candidates Compact array of candidates
+ * \param d_offsets First index of each particle's candidates in \a d_candidates
+ * \param find_candidate Finder for candidate bonds
+ * \param d_n_neigh Number of neighbors of each particle
+ * \param d_nlist Neighbor list
+ * \param d_head_list Start of each particle's neighbors in \a d_nlist
+ * \param N Number of local particles
+ * \param block_size Number of threads per block
+ */
+cudaError_t write_bond_candidates(detail::BondCandidate* d_candidates,
+                                  const unsigned int* d_offsets,
+                                  const detail::BondCandidateFinder& find_candidate,
+                                  const unsigned int* d_n_neigh,
+                                  const unsigned int* d_nlist,
+                                  const size_t* d_head_list,
+                                  const unsigned int N,
+                                  const unsigned int block_size)
+    {
+    unsigned int max_block_size;
+    cudaFuncAttributes attr;
+    cudaFuncGetAttributes(&attr, (const void*)kernel::find_bond_candidates);
+    max_block_size = attr.maxThreadsPerBlock;
+
+    const unsigned int run_block_size = min(block_size, max_block_size);
+    kernel::find_bond_candidates<<<N / run_block_size + 1, run_block_size>>>(nullptr,
+                                                                             d_candidates,
+                                                                             d_offsets,
+                                                                             find_candidate,
+                                                                             d_n_neigh,
+                                                                             d_nlist,
+                                                                             d_head_list,
+                                                                             N);
+
+    return cudaSuccess;
+    }
+
+/*!
+ * \param d_candidates Candidate bonds
+ * \param num_candidates Number of candidate bonds
+ * \param alloc Allocator for temporary memory
+ */
+cudaError_t sort_bond_candidates(detail::BondCandidate* d_candidates,
+                                 const unsigned int num_candidates,
+                                 CachedAllocator& alloc)
+    {
+    thrust::device_ptr<detail::BondCandidate> candidates(d_candidates);
+    thrust::sort(thrust::cuda::par(alloc),
+                 candidates,
+                 candidates + num_candidates,
+                 detail::CompareBondCandidatesByDistance());
+
     return cudaSuccess;
     }
 
     } // end namespace gpu
     } // end namespace azplugins
-
     } // end namespace hoomd

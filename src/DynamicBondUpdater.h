@@ -2,8 +2,6 @@
 // Copyright (c) 2021-2025, Auburn University
 // Part of azplugins, released under the BSD 3-Clause License.
 
-// Maintainer: astatt
-
 /*!
  * \file DynamicBondUpdater.h
  * \brief Declaration of DynamicBondUpdater
@@ -12,245 +10,206 @@
 #ifndef AZPLUGINS_DYNAMIC_BOND_UPDATER_H_
 #define AZPLUGINS_DYNAMIC_BOND_UPDATER_H_
 
-#ifdef NVCC
+#ifdef __HIPCC__
 #error This header cannot be compiled by nvcc
 #endif
 
-#ifndef __HIPCC__
-#include <pybind11/pybind11.h>
-#endif
+#include "DynamicBondCandidate.h"
 
-#include "hoomd/AABBTree.h"
+#include "hoomd/GPUVector.h"
 #include "hoomd/ParticleGroup.h"
 #include "hoomd/Updater.h"
 #include "hoomd/md/NeighborList.h"
 
-#ifndef __HIPCC__
-#define HOSTDEVICE __host__ __device__
-#else
-#define HOSTDEVICE
-#endif // __HIPCC__
-
-#ifndef PYBIND11_EXPORT
-#define PYBIND11_EXPORT __attribute__((visibility("default")))
-#endif
+#include <pybind11/pybind11.h>
+#include <string>
+#include <vector>
 
 namespace hoomd
     {
-
 namespace azplugins
     {
 
-//! Dynamic bond formation
+//! Form bonds dynamically between nearby particles
 /*!
- * Adds bonds between two groups of particles, which can either be 100% identical or
- * completely  different. It uses a cutoff and a maximum number of  bonds on each
- * particle, and optionally a probability of bond formation. Internally, a tree
- * neighbor list is used to efficiently find all possible bond formation pairs, which
- * is then sorted and down selected before the bonds are added to the system sequentially.
+ * Bonds of one type are formed between particles in two groups that are closer than a cutoff
+ * distance. The groups must either be identical or have no particles in common. Each particle can
+ * have a maximum number of bonds of this type, which depends on its group. Bonds are formed in
+ * order of increasing distance between the particles, and each pair of particles that is close
+ * enough is considered for bonding with a fixed probability.
  *
- * \warning This updater should not be used with MPI.
+ * Pairs of particles are found using a neighbor list. The updater adds its cutoff to the neighbor
+ * list like a pair potential does, so the neighbor list can be shared with pair potentials. Pairs
+ * of particles that are excluded from the neighbor list never form bonds.
  *
+ * Each update proceeds in the following steps:
+ *
+ * 1. Each rank finds candidate bonds between its local particles and their neighbors.
+ * 2. With MPI, the candidates are gathered on the root rank. A pair of particles owned by two
+ *    different ranks is found on both ranks, and these two partial candidates are merged.
+ * 3. The root rank selects the bonds to form by accepting the candidates in order of priority
+ *    if both particles can still form a bond.
+ * 4. With MPI, the new bonds are broadcast. All ranks add the new bonds in the same order.
+ *
+ * Step 3 is sequential, so it is performed on the CPU even when the other steps run on the GPU.
  */
-
 class PYBIND11_EXPORT DynamicBondUpdater : public Updater
     {
     public:
-    //! Simple constructor
+    //! Constructor
     DynamicBondUpdater(std::shared_ptr<SystemDefinition> sysdef,
                        std::shared_ptr<Trigger> trigger,
+                       std::shared_ptr<md::NeighborList> nlist,
                        std::shared_ptr<ParticleGroup> group_1,
                        std::shared_ptr<ParticleGroup> group_2,
-                       uint16_t seed);
-
-    //! Constructor with parameters
-    DynamicBondUpdater(std::shared_ptr<SystemDefinition> sysdef,
-                       std::shared_ptr<Trigger> trigger,
-                       std::shared_ptr<ParticleGroup> group_1,
-                       std::shared_ptr<ParticleGroup> group_2,
-                       uint16_t seed,
-                       const Scalar r_cut,
-                       const Scalar probability,
-                       unsigned int max_bonds_group_1,
-                       unsigned int max_bonds_group_2,
-                       unsigned int bond_type);
+                       const std::string& bond_type,
+                       Scalar r_cut,
+                       unsigned int max_bonds_1,
+                       unsigned int max_bonds_2,
+                       Scalar probability);
 
     //! Destructor
     virtual ~DynamicBondUpdater();
 
-    //! update
-    virtual void update(uint64_t timestep);
+    //! Form new bonds
+    void update(uint64_t timestep) override;
 
-    //! Set the cutoff distance for finding bonds
-    /*!
-     * \param r_cut cutoff distance between particles for finding potential bonds
-     */
-    void setRcut(Scalar r_cut)
+    //! Notify that the updater has been detached from the simulation
+    void notifyDetach() override;
+
+    //! Get the first group of particles
+    std::shared_ptr<ParticleGroup> getGroup1() const
         {
-        m_r_cut = r_cut;
-        checkRcut();
-        setCutoffs();
+        return m_group_1;
         }
-    //! Get the cutoff distance between particles for finding bonds
-    Scalar getRcut()
+
+    //! Get the second group of particles
+    std::shared_ptr<ParticleGroup> getGroup2() const
+        {
+        return m_group_2;
+        }
+
+    //! Get the name of the type of bonds to form
+    std::string getBondType() const
+        {
+        return m_bond_data->getNameByType(m_bond_type);
+        }
+
+    //! Set the name of the type of bonds to form
+    void setBondType(const std::string& bond_type)
+        {
+        m_bond_type = m_bond_data->getTypeByName(bond_type);
+        }
+
+    //! Get the cutoff distance for forming bonds
+    Scalar getRCut() const
         {
         return m_r_cut;
         }
-    //! Set the bond type of the dynamically formed bonds
-    /*!
-     * \param bond_type type of bonds to be formed
-     */
-    void setBondType(unsigned int bond_type)
+
+    //! Set the cutoff distance for forming bonds
+    void setRCut(Scalar r_cut);
+
+    //! Get the maximum number of bonds of particles in the first group
+    unsigned int getMaxBonds1() const
         {
-        // m_bond_data = m_sysdef->getBondData();
-        // m_bond_type = m_bond_data->getTypeByName(bond_type);
-        m_bond_type = bond_type;
-        checkBondType();
-        }
-    //! Get the bond type of the dynamically formed bonds
-    unsigned int getBondType()
-        {
-        return m_bond_type;
+        return m_max_bonds_1;
         }
 
-    //! Set the maximum number of bonds on particles in group_1
-    /*!
-     * \param max_bonds_group_1 max number of bonds formed by particles in group 1
-     */
-    void setMaxBondsGroup1(unsigned int max_bonds_group_1)
+    //! Set the maximum number of bonds of particles in the first group
+    void setMaxBonds1(unsigned int max_bonds)
         {
-        m_max_bonds_group_1 = max_bonds_group_1;
-        checkMaxBondsGroup();
+        checkMaxBonds(max_bonds);
+        m_max_bonds_1 = max_bonds;
         }
-    //! Get the maximum number of bonds on particles in group_1
-    unsigned int getMaxBondsGroup1()
+
+    //! Get the maximum number of bonds of particles in the second group
+    unsigned int getMaxBonds2() const
         {
-        return m_max_bonds_group_1;
+        return m_max_bonds_2;
         }
-    //! Set the maximum number of bonds on particles in group_2
-    /*!
-     * \param max_bonds_group_2 max number of bonds formed by particles in group_2
-     */
-    void setMaxBondsGroup2(unsigned int max_bonds_group_2)
+
+    //! Set the maximum number of bonds of particles in the second group
+    void setMaxBonds2(unsigned int max_bonds)
         {
-        m_max_bonds_group_2 = max_bonds_group_2;
-        checkMaxBondsGroup();
+        checkMaxBonds(max_bonds);
+        m_max_bonds_2 = max_bonds;
         }
-    //! Get the maximum number of bonds on particles in group_2
-    unsigned int getMaxBondsGroup2()
-        {
-        return m_max_bonds_group_2;
-        }
-    //! set probablilty
-    void setProbability(Scalar probability)
-        {
-        m_probability = probability;
-        checkProbability();
-        }
-    //! Get the probability
-    Scalar getProbability()
+
+    //! Get the probability to form a bond
+    Scalar getProbability() const
         {
         return m_probability;
         }
 
-    void setNeighborList(std::shared_ptr<md::NeighborList> pair_nlist)
-        {
-        m_pair_nlist = pair_nlist;
-        m_pair_nlist_exclusions_set = true;
-        }
+    //! Set the probability to form a bond
+    void setProbability(Scalar probability);
 
     protected:
-    std::shared_ptr<BondData> m_bond_data; //!< Bond data
+    std::shared_ptr<md::NeighborList> m_nlist; //!< Neighbor list to find pairs of particles
+    std::shared_ptr<ParticleGroup> m_group_1;  //!< First group of particles that form bonds
+    std::shared_ptr<ParticleGroup> m_group_2;  //!< Second group of particles that form bonds
+    std::shared_ptr<BondData> m_bond_data;     //!< Bonds in the system
+    unsigned int m_bond_type;                  //!< Type of bonds to form
+    Scalar m_r_cut;                            //!< Cutoff distance for forming bonds
+    unsigned int m_max_bonds_1;                //!< Maximum number of bonds in the first group
+    unsigned int m_max_bonds_2;                //!< Maximum number of bonds in the second group
+    Scalar m_probability;                      //!< Probability to form a bond
+    bool m_groups_identical;                   //!< True if the groups have the same particles
 
-    std::shared_ptr<ParticleGroup> m_group_1; //!< First particle group to form bonds with
-    std::shared_ptr<ParticleGroup> m_group_2; //!< Second particle group to form bonds with
-    bool m_groups_identical; //!< whether or not the two groups are identical. Set true if they are
-                             //!< identical.
+    GPUVector<unsigned int> m_group_ids;  //!< Group (1 or 2) of each local particle, 0 if none
+    GPUVector<unsigned int> m_free_bonds; //!< Number of bonds each local particle can still form
+    std::vector<detail::BondCandidate> m_candidates; //!< Candidate bonds
+    std::vector<uint2> m_new_bonds;                  //!< Tags of particles in new bonds
 
-    Scalar m_r_cut; //!< cutoff for the bond forming criterion
-    Scalar
-        m_probability; //!< probability of bond formation if bond can be formed (i.e. within cutoff)
-    unsigned int m_bond_type; //!< Type id of the bond to form
-    unsigned int
-        m_max_bonds_group_1; //!< maximum number of bonds which can be formed by the first group
-    unsigned int
-        m_max_bonds_group_2; //!< maximum number of bonds which can be formed by the second group
-    uint16_t m_seed;         //!< seed for random number generator for bond probability
+    //! Compute the group and number of free bonds of each local particle
+    virtual void computeBondingState();
 
-    unsigned int m_max_bonds; //!<  maximum number of possible bonds (or neighbors) which can be
-                              //!<  found, is resized if overflow is triggered
-    unsigned int m_max_bonds_overflow; //!< registers if there is an overflow in  maximum number of
-                                       //!< possible bonds
+    //! Find candidate bonds involving local particles, sorted by priority
+    virtual void findBondCandidates(uint64_t timestep);
 
-    GPUArray<Scalar3>
-        m_all_possible_bonds; //!< list of possible bonds, size: NumMembers(group_1)*m_max_bonds
-    unsigned int m_num_all_possible_bonds; //!< number of valid possible bonds at the beginning of
-                                           //!< m_all_possible_bonds
+    private:
+    std::shared_ptr<GPUArray<Scalar>> m_r_cut_nlist; //!< Cutoff matrix for the neighbor list
+    bool m_attached;                                 //!< True if the updater is attached
+    bool m_particles_changed;                        //!< True if the number of particles changed
+    std::vector<unsigned int> m_num_new_bonds; //!< Number of new bonds of each particle (by tag)
 
-    GPUArray<unsigned int>
-        m_existing_bonds_list; //!< List of existing bonded particles referenced by tag
-    GPUArray<unsigned int>
-        m_n_existing_bonds;                 //!< Number of existing bonds for a given particle tag
-    unsigned int m_max_existing_bonds_list; //!< maximum number of  bonds in list of existing bonded
-                                            //!< particles
-    Index2D
-        m_existing_bonds_list_indexer; //!< Indexer for accessing the by-tag bonded particle list
+#ifdef ENABLE_MPI
+    std::shared_ptr<Communicator> m_comm; //!< Communicator
 
-    std::shared_ptr<md::NeighborList>
-        m_pair_nlist; //!< The hoomd neighborlist, only used if exclusions of the newly formed bonds
-                      //!< need to be set
-    bool m_pair_nlist_exclusions_set; //!< whether or not the bonds are set as exclusions in the
-                                      //!< hoomd particle neighborlist. Set to true when
-                                      //!< m_pair_nlist is set
+    //! Gather candidate bonds from all ranks on the root rank
+    void gatherBondCandidates();
+#endif // ENABLE_MPI
 
-    std::shared_ptr<md::NeighborList>
-        m_pair_internal_nlist; // internal list for finding all possible bonds
+    //! Select bonds to form from the candidates
+    void selectBonds();
 
-    //! filter out existing and doublicate bonds from all found possible bonds
-    virtual void filterPossibleBonds();
+    //! Form the selected bonds
+    void formBonds(uint64_t timestep);
 
-    bool CheckisExistingLegalBond(Scalar3 i); // this acesses info in m_existing_bonds_list_tag.
+    //! Determine if the groups are identical or have no particles in common
+    void checkGroups();
 
-    void calculateExistingBonds();
-    void makeBonds(uint64_t timestep);
+    //! Check that a maximum number of bonds is valid
+    void checkMaxBonds(unsigned int max_bonds) const;
 
-    bool isExistingBond(unsigned int tag1,
-                        unsigned int tag2); // this acesses info in m_existing_bonds_list_tag
-    void checkBoxSize();
-    void checkRcut();
-    void checkBondType();
-    void checkProbability();
-    void setGroupOverlap();
-    void setCutoffs();
-    void checkMaxBondsGroup();
-    void resizePossibleBondlists();
-    void resizeExistingBondList();
-    void allocateParticleArrays();
+    //! Set the cutoff for each pair of particle types in the neighbor list
+    void updateRCutMatrix();
 
-    //! Notification of a box size change
-    void slotBoxChanged()
+    //! Notification that the global number of particles changed
+    void slotGlobalParticleNumberChange()
         {
-        m_box_changed = true;
+        m_particles_changed = true;
         }
-
-    //! Notification of total particle number change
-    void slotNumParticlesChanged()
-        {
-        m_max_N_changed = true;
-        }
-
-    bool m_box_changed;   //!< Flag if box dimensions changed
-    bool m_max_N_changed; //!< Flag if total number of particles changed
     };
 
 namespace detail
     {
-//! Export the Evaporator to python
+//! Export DynamicBondUpdater to python
 void export_DynamicBondUpdater(pybind11::module& m);
     } // end namespace detail
 
     } // end namespace azplugins
-
     } // end namespace hoomd
 
-#endif // AZPLUGINS_TYPE_UPDATER_H_
+#endif // AZPLUGINS_DYNAMIC_BOND_UPDATER_H_
