@@ -78,7 +78,11 @@ DynamicBondUpdater::~DynamicBondUpdater()
     {
     m_exec_conf->msg->notice(5) << "Destroying DynamicBondUpdater" << std::endl;
 
-    notifyDetach();
+    if (m_attached)
+        {
+        m_nlist->removeRCutMatrix(m_r_cut_nlist);
+        m_nlist->notifyRCutMatrixChange();
+        }
 
     m_pdata->getGlobalParticleNumberChangeSignal()
         .disconnect<DynamicBondUpdater, &DynamicBondUpdater::slotGlobalParticleNumberChange>(this);
@@ -138,6 +142,10 @@ void DynamicBondUpdater::update(uint64_t timestep)
     formBonds(timestep);
     }
 
+/*!
+ * The cutoff matrix is removed from the neighbor list. Removing a matrix does not notify the
+ * neighbor list, so the change is signaled explicitly to refresh its cutoffs.
+ */
 void DynamicBondUpdater::notifyDetach()
     {
     if (m_attached)

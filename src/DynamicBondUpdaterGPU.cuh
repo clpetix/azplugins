@@ -25,6 +25,10 @@ namespace azplugins
 namespace gpu
     {
 
+//! Set the group and number of free bonds of all local particles to zero
+cudaError_t
+zero_bonding_state(unsigned int* d_group_ids, unsigned int* d_free_bonds, const unsigned int N);
+
 //! Set the group and number of free bonds of the particles in a group
 cudaError_t set_bonding_state(unsigned int* d_group_ids,
                               unsigned int* d_free_bonds,

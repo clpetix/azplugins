@@ -121,6 +121,22 @@ __global__ void find_bond_candidates(size_t* d_counts,
 /*!
  * \param d_group_ids Group of each local particle
  * \param d_free_bonds Number of free bonds of each local particle
+ * \param N Number of local particles
+ */
+cudaError_t
+zero_bonding_state(unsigned int* d_group_ids, unsigned int* d_free_bonds, const unsigned int N)
+    {
+    cudaError_t result = cudaMemset(d_group_ids, 0, sizeof(unsigned int) * N);
+    if (result != cudaSuccess)
+        {
+        return result;
+        }
+    return cudaMemset(d_free_bonds, 0, sizeof(unsigned int) * N);
+    }
+
+/*!
+ * \param d_group_ids Group of each local particle
+ * \param d_free_bonds Number of free bonds of each local particle
  * \param d_members Indexes of the particles in the group
  * \param num_members Number of particles in the group
  * \param group_id Group of the particles (1 or 2)

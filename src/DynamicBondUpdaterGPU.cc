@@ -76,8 +76,9 @@ void DynamicBondUpdaterGPU::computeBondingState()
     ArrayHandle<unsigned int> d_free_bonds(m_free_bonds,
                                            access_location::device,
                                            access_mode::overwrite);
-    cudaMemset(d_group_ids.data, 0, sizeof(unsigned int) * N);
-    cudaMemset(d_free_bonds.data, 0, sizeof(unsigned int) * N);
+    gpu::zero_bonding_state(d_group_ids.data, d_free_bonds.data, N);
+    if (m_exec_conf->isCUDAErrorCheckingEnabled())
+        CHECK_CUDA_ERROR();
 
     ArrayHandle<BondData::members_t> d_bond_table(m_bond_data->getGPUTable(),
                                                   access_location::device,
