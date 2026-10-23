@@ -10,6 +10,8 @@
 #ifndef AZPLUGINS_RNG_IDENTIFIERS_H_
 #define AZPLUGINS_RNG_IDENTIFIERS_H_
 
+#include <cstdint>
+
 namespace hoomd
     {
 namespace azplugins
@@ -24,6 +26,7 @@ struct RNGIdentifier
     static const uint8_t TwoStepBrownianFlow = 201;
     static const uint8_t TwoStepLangevinFlow = 202;
     static const uint8_t ParticleEvaporator = 203;
+    static const uint8_t DynamicBondUpdater = 204;
     };
 
     } // end namespace detail
